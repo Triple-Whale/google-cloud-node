@@ -218,7 +218,9 @@ export class LeaseManager extends EventEmitter {
 
     if (wasFull && !this.isFull()) {
       process.nextTick(() => this.emit('free'));
-    } else if (this._pending.includes(message)) {
+    }
+
+    if (this._pending.includes(message)) {
       const index = this._pending.indexOf(message);
       this._pending.splice(index, 1);
     } else if (this.pending > 0) {
