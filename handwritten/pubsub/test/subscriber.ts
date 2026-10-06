@@ -260,8 +260,16 @@ describe('Subscriber', () => {
       assert.strictEqual(subscriber.maxMessages, 1000);
     });
 
-    it('should default maxBytes to 100MB', () => {
-      assert.strictEqual(subscriber.maxBytes, 100 * 1024 * 1024);
+    it('should default maxBytes to 500 MiB', () => {
+      for (const options of [
+        {},
+        {flowControl: {}},
+        {flowControl: {maxMessages: 1000}},
+      ]) {
+        const sub = new Subscriber(subscription, options);
+        assert.strictEqual(sub.maxMessages, 1000);
+        assert.strictEqual(sub.maxBytes, 524288000);
+      }
     });
 
     it('should set isOpen to false', () => {
@@ -979,7 +987,7 @@ describe('Subscriber', () => {
     });
 
     it('should pass in flow control options', () => {
-      const flowControl = {maxMessages: 100};
+      const flowControl = {maxMessages: 100, maxBytes: 1000};
 
       subscriber.setOptions({flowControl});
       subscriber.open();
@@ -987,6 +995,8 @@ describe('Subscriber', () => {
       const inventory: FakeLeaseManager = stubs.get('inventory');
 
       assert.strictEqual(inventory.options, flowControl);
+      assert.strictEqual(subscriber.maxMessages, flowControl.maxMessages);
+      assert.strictEqual(subscriber.maxBytes, flowControl.maxBytes);
     });
 
     it('should pass in streaming options', () => {
@@ -1117,6 +1127,21 @@ describe('Subscriber', () => {
       const stream: FakeMessageStream = stubs.get('messageStream');
 
       assert.strictEqual(stream.options.maxStreams, maxMessages);
+    });
+
+    it('should update local flow control without reopening the stream', () => {
+      subscriber.open();
+      const inventory: FakeLeaseManager = stubs.get('inventory');
+      const stream: FakeMessageStream = stubs.get('messageStream');
+      const stub = sandbox.stub(inventory, 'setOptions');
+      const flowControl = {maxMessages: 20, maxBytes: 200};
+
+      subscriber.setOptions({flowControl});
+
+      assert.strictEqual(subscriber.maxMessages, flowControl.maxMessages);
+      assert.strictEqual(subscriber.maxBytes, flowControl.maxBytes);
+      assert.deepStrictEqual(stub.firstCall.args, [flowControl]);
+      assert.strictEqual(stubs.get('messageStream'), stream);
     });
 
     it('should pass through the max extension time', () => {

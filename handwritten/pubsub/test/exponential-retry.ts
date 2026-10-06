@@ -105,6 +105,71 @@ describe('exponential retry class', () => {
     assert.strictEqual(leftovers.length, 1);
   });
 
+  it('removes a reset item from the retry queue', () => {
+    const clock = TestUtils.useFakeTimers(sandbox);
+    const er = new ExponentialRetry<TestItem>(
+      Duration.from({milliseconds: 100}),
+      Duration.from({milliseconds: 1000}),
+    );
+    sandbox.stub(global.Math, 'random').returns(0.5);
+
+    const item = makeItem();
+    const callback = sandbox.spy();
+    er.retryLater(item, callback);
+    er.reset(item);
+
+    clock.tick(100);
+
+    assert.strictEqual(callback.called, false);
+    assert.deepStrictEqual(er.close(), []);
+  });
+
+  it('preserves other queued retries when an item is reset', () => {
+    const clock = TestUtils.useFakeTimers(sandbox);
+    const er = new ExponentialRetry<TestItem>(
+      Duration.from({milliseconds: 100}),
+      Duration.from({milliseconds: 1000}),
+    );
+    sandbox.stub(global.Math, 'random').returns(0.5);
+
+    const items = [makeItem(), makeItem(), makeItem()];
+    const callbacks = items.map(() => sandbox.spy());
+    items.forEach((item, index) => er.retryLater(item, callbacks[index]));
+    er.reset(items[0]);
+
+    clock.tick(100);
+
+    assert.strictEqual(callbacks[0].called, false);
+    assert.strictEqual(callbacks[1].callCount, 1);
+    assert.strictEqual(callbacks[2].callCount, 1);
+    assert.deepStrictEqual(er.close(), []);
+  });
+
+  it('starts a fresh retry after resetting an item', () => {
+    const clock = TestUtils.useFakeTimers(sandbox);
+    const er = new ExponentialRetry<TestItem>(
+      Duration.from({milliseconds: 100}),
+      Duration.from({milliseconds: 1000}),
+    );
+    sandbox.stub(global.Math, 'random').returns(0.5);
+
+    const item = makeItem();
+    const callback = sandbox.spy();
+    er.reset(item);
+    er.retryLater(item, callback);
+    clock.tick(100);
+
+    er.reset(item);
+    er.reset(item);
+    er.retryLater(item, callback);
+    clock.tick(100);
+
+    assert.strictEqual(callback.callCount, 2);
+    assert.strictEqual(callback.secondCall.args[0], item);
+    assert.strictEqual(callback.secondCall.args[1].milliseconds, 100);
+    assert.deepStrictEqual(er.close(), []);
+  });
+
   it('backs off exponentially', () => {
     const clock = TestUtils.useFakeTimers(sandbox);
     const er = new ExponentialRetry<TestItem>(
