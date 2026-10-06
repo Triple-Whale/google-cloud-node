@@ -26,7 +26,7 @@ export const defaultOptions = {
 
     // The maximum amount of message data that may be queued for receiving,
     // in bytes, with the default lease manager.
-    maxOutstandingBytes: 100 * 1024 * 1024,
+    maxOutstandingBytes: 500 * 1024 * 1024,
 
     // The minimum length of time a message's lease will be extended by.
     minAckDeadline: undefined,

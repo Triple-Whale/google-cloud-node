@@ -91,6 +91,7 @@ class FakeMessage {
 interface LeaseManagerInternals {
   _extendDeadlines(): void;
   _messages: Set<Message>;
+  _options: leaseTypes.FlowControlOptions;
   _isLeasing: boolean;
   _scheduleExtension(): void;
 }
@@ -642,6 +643,14 @@ describe('LeaseManager', () => {
     it('should allow excess messages by default', () => {});
 
     it('should default maxBytes', () => {
+      for (const options of [undefined, {}, {maxMessages: 1000}]) {
+        leaseManager.setOptions(options!);
+        assert.strictEqual(
+          getLMInternals(leaseManager)._options.maxBytes,
+          524288000,
+        );
+      }
+
       const littleMessage = new FakeMessage() as {} as Message;
       const bigMessage = new FakeMessage();
 

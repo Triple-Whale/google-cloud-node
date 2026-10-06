@@ -57,7 +57,8 @@ const PULL_TIMEOUT = require('./v1-old/subscriber_client_config.json').interface
  *     underlying streams. See
  *     {@link https://nodejs.org/en/docs/guides/backpressuring-in-streams/} for
  *     more details.
- * @property {number} [maxStreams=5] Number of streaming connections to make.
+ * @property {number} [maxStreams=5] Number of streaming connections to make,
+ *     capped by the positive aggregate message and byte limits.
  * @property {number} [timeout=300000] Timeout for establishing a connection.
  */
 export interface MessageStreamOptions {
@@ -160,6 +161,8 @@ interface StreamTracked {
 export class MessageStream extends PassThrough {
   private _keepAliveHandle?: NodeJS.Timeout;
   private _options: MessageStreamOptions;
+  private _maxMessages: number;
+  private _maxBytes: number;
   private _retrier: ExponentialRetry<StreamTracked>;
 
   private _streams: StreamTracked[];
@@ -176,8 +179,28 @@ export class MessageStream extends PassThrough {
       options.retryMaxBackoff!,
     );
 
+    const maxStreams = Math.floor(
+      Math.min(
+        options.maxStreams!,
+        sub.maxMessages > 0 ? sub.maxMessages : Infinity,
+        sub.maxBytes > 0 ? sub.maxBytes : Infinity,
+      ),
+    );
+
+    // Keep the opening allocation for replacements until the subscriber reopens.
+    this._maxMessages = sub.useLegacyFlowControl
+      ? 0
+      : sub.maxMessages > 0
+        ? Math.floor(sub.maxMessages / maxStreams)
+        : sub.maxMessages;
+    this._maxBytes = sub.useLegacyFlowControl
+      ? 0
+      : sub.maxBytes > 0
+        ? Math.floor(sub.maxBytes / maxStreams)
+        : sub.maxBytes;
+
     this._streams = [];
-    for (let i = 0; i < options.maxStreams!; i++) {
+    for (let i = 0; i < maxStreams; i++) {
       this._streams.push({});
     }
 
@@ -387,12 +410,8 @@ export class MessageStream extends PassThrough {
     const request: StreamingPullRequest = {
       subscription: this._subscriber.name,
       streamAckDeadlineSeconds: this._subscriber.ackDeadline,
-      maxOutstandingMessages: this._subscriber.useLegacyFlowControl
-        ? 0
-        : this._subscriber.maxMessages,
-      maxOutstandingBytes: this._subscriber.useLegacyFlowControl
-        ? 0
-        : this._subscriber.maxBytes,
+      maxOutstandingMessages: this._maxMessages,
+      maxOutstandingBytes: this._maxBytes,
       clientId: randomUUID().toString(),
       protocolVersion: 1, // Set protocol version to enable server keepalives
     };

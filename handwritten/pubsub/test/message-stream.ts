@@ -295,6 +295,152 @@ describe('MessageStream', () => {
     });
   });
 
+  describe('flow control', () => {
+    beforeEach(() => {
+      messageStream.destroy();
+      client.streams.length = 0;
+    });
+
+    const allocations = [
+      {
+        name: 'divide explicit limits between streams',
+        maxMessages: 100,
+        maxBytes: 1000,
+        maxStreams: 2,
+        streams: 2,
+        messages: 50,
+        bytes: 500,
+      },
+      {
+        name: 'divide the defaults between five streams',
+        maxMessages: 1000,
+        maxBytes: 524288000,
+        maxStreams: 5,
+        streams: 5,
+        messages: 200,
+        bytes: 104857600,
+      },
+      {
+        name: 'give one stream the entire default limits',
+        maxMessages: 1000,
+        maxBytes: 524288000,
+        maxStreams: 1,
+        streams: 1,
+        messages: 1000,
+        bytes: 524288000,
+      },
+      {
+        name: 'leave message and byte remainders unused',
+        maxMessages: 1000,
+        maxBytes: 524288000,
+        maxStreams: 3,
+        streams: 3,
+        messages: 333,
+        bytes: 174762666,
+      },
+      {
+        name: 'limit the stream count to the message budget',
+        maxMessages: 3,
+        maxBytes: 1000,
+        maxStreams: 5,
+        streams: 3,
+        messages: 1,
+        bytes: 333,
+      },
+      {
+        name: 'limit the stream count to the byte budget',
+        maxMessages: 100,
+        maxBytes: 1,
+        maxStreams: 5,
+        streams: 1,
+        messages: 100,
+        bytes: 1,
+      },
+    ];
+
+    for (const allocation of allocations) {
+      it(`should ${allocation.name}`, async () => {
+        subscriber.maxMessages = allocation.maxMessages;
+        subscriber.maxBytes = allocation.maxBytes;
+        const spy = sandbox.spy(FakeGrpcStream.prototype, 'write');
+
+        messageStream = new MessageStream(subscriber, {
+          maxStreams: allocation.maxStreams,
+        });
+        await messageStream.start();
+
+        assert.strictEqual(client.streams.length, allocation.streams);
+        assert.strictEqual(spy.callCount, allocation.streams);
+        for (const call of spy.getCalls()) {
+          const request = call.args[0] as {
+            maxOutstandingMessages: number;
+            maxOutstandingBytes: number;
+          };
+          assert.strictEqual(
+            request.maxOutstandingMessages,
+            allocation.messages,
+          );
+          assert.strictEqual(request.maxOutstandingBytes, allocation.bytes);
+        }
+      });
+    }
+
+    it('should disable server flow control in legacy mode', async () => {
+      subscriber.useLegacyFlowControl = true;
+      const spy = sandbox.spy(FakeGrpcStream.prototype, 'write');
+
+      messageStream = new MessageStream(subscriber);
+      await messageStream.start();
+
+      for (const call of spy.getCalls()) {
+        const request = call.args[0] as {
+          maxOutstandingMessages: number;
+          maxOutstandingBytes: number;
+        };
+        assert.strictEqual(request.maxOutstandingMessages, 0);
+        assert.strictEqual(request.maxOutstandingBytes, 0);
+      }
+    });
+
+    it('should retain opening quotas on replacement until reopened', async () => {
+      subscriber.maxMessages = 100;
+      subscriber.maxBytes = 1000;
+      messageStream = new MessageStream(subscriber, {maxStreams: 2});
+      await messageStream.start();
+      messageStream.on('data', () => {});
+
+      subscriber.maxMessages = 20;
+      subscriber.maxBytes = 200;
+      const spy = sandbox.spy(FakeGrpcStream.prototype, 'write');
+      const [stream] = client.streams;
+      stream.emit('status', {code: grpc.status.UNAVAILABLE});
+      stream.push(null);
+      await promisify(process.nextTick)();
+      await sandbox.clock.tickAsync(200);
+
+      assert.strictEqual(client.streams.length, 3);
+      assert.strictEqual(spy.callCount, 1);
+      let request = spy.firstCall.args[0] as {
+        maxOutstandingMessages: number;
+        maxOutstandingBytes: number;
+      };
+      assert.strictEqual(request.maxOutstandingMessages, 50);
+      assert.strictEqual(request.maxOutstandingBytes, 500);
+
+      messageStream.destroy();
+      spy.resetHistory();
+      messageStream = new MessageStream(subscriber, {maxStreams: 2});
+      await messageStream.start();
+
+      assert.strictEqual(spy.callCount, 2);
+      for (const call of spy.getCalls()) {
+        request = call.args[0] as typeof request;
+        assert.strictEqual(request.maxOutstandingMessages, 10);
+        assert.strictEqual(request.maxOutstandingBytes, 100);
+      }
+    });
+  });
+
   describe('destroy', () => {
     it('should noop if already destroyed', done => {
       messageStream.on('close', done);
