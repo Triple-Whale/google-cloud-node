@@ -1128,6 +1128,10 @@ export class Subscription extends EventEmitter {
   /**
    * Sets the Subscription options.
    *
+   * Flow control changes update the local inventory immediately. The aggregate
+   * message and byte limits are divided equally across streams when opening the
+   * subscription. Close and reopen it to apply new limits to the streams.
+   *
    * @param {SubscriberOptions} options The options.
    */
   setOptions(options: SubscriberOptions): void {

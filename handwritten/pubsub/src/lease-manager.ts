@@ -48,8 +48,8 @@ export interface FlowControlOptions {
  *     Setting this option to false will make the client manage any excess
  *     messages until you're ready for them. This will prevent them from being
  *     redelivered and make the maxMessages option behave more predictably.
- * @property {number} [maxBytes=104857600] The desired amount of memory to
- *     allow message data to consume. (Default: 100MB) It's possible that this
+ * @property {number} [maxBytes=524288000] The desired amount of memory to
+ *     allow message data to consume. (Default: 500 MiB) It's possible that this
  *     value will be exceeded, since messages are received in batches.
  * @property {number} [maxMessages=1000] The desired number of messages to allow
  *     in memory before pausing the message stream. Unless allowExcessMessages
@@ -218,7 +218,9 @@ export class LeaseManager extends EventEmitter {
 
     if (wasFull && !this.isFull()) {
       process.nextTick(() => this.emit('free'));
-    } else if (this._pending.includes(message)) {
+    }
+
+    if (this._pending.includes(message)) {
       const index = this._pending.indexOf(message);
       this._pending.splice(index, 1);
     } else if (this.pending > 0) {

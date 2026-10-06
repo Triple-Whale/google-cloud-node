@@ -91,6 +91,7 @@ class FakeMessage {
 interface LeaseManagerInternals {
   _extendDeadlines(): void;
   _messages: Set<Message>;
+  _options: leaseTypes.FlowControlOptions;
   _isLeasing: boolean;
   _scheduleExtension(): void;
 }
@@ -460,10 +461,16 @@ describe('LeaseManager', () => {
 
   describe('clear', () => {
     it('should completely clear out the inventory', () => {
-      leaseManager.add(new FakeMessage() as {} as Message);
-      leaseManager.add(new FakeMessage() as {} as Message);
-      leaseManager.clear();
+      const active = new FakeMessage() as {} as Message;
+      const pending = new FakeMessage() as {} as Message;
+      leaseManager.setOptions({allowExcessMessages: false, maxMessages: 1});
+      leaseManager.add(active);
+      leaseManager.add(pending);
 
+      const cleared = leaseManager.clear();
+
+      assert.deepStrictEqual(cleared, [active, pending]);
+      assert.strictEqual(leaseManager.pending, 0);
       assert.strictEqual(leaseManager.bytes, 0);
       assert.strictEqual(leaseManager.size, 0);
     });
@@ -572,6 +579,8 @@ describe('LeaseManager', () => {
     });
 
     it('should remove a message from the pending state', done => {
+      const active = new FakeMessage();
+      active.length = 40;
       const pending = new FakeMessage() as {} as Message;
 
       leaseManager.setOptions({allowExcessMessages: false, maxMessages: 1});
@@ -582,11 +591,13 @@ describe('LeaseManager', () => {
         }
       });
 
-      leaseManager.add(new FakeMessage() as {} as Message);
+      leaseManager.add(active as {} as Message);
       leaseManager.add(pending);
       leaseManager.remove(pending);
 
       assert.strictEqual(leaseManager.pending, 0);
+      assert.strictEqual(leaseManager.size, 1);
+      assert.strictEqual(leaseManager.bytes, active.length);
       setImmediate(done);
     });
 
@@ -602,6 +613,8 @@ describe('LeaseManager', () => {
         }
 
         assert.strictEqual(leaseManager.size, 1);
+        assert.strictEqual(leaseManager.bytes, pending.length);
+        assert.strictEqual(leaseManager.pending, 0);
         assert.strictEqual(message, pending);
         done();
       });
@@ -609,6 +622,57 @@ describe('LeaseManager', () => {
       leaseManager.add(temp);
       leaseManager.add(pending);
       leaseManager.remove(temp);
+    });
+
+    it('should dispense a pending message when byte capacity opens', done => {
+      const active = new FakeMessage();
+      active.length = 100;
+      const pending = new FakeMessage() as {} as Message;
+      const received: Message[] = [];
+      const free = sandbox.spy();
+
+      leaseManager.setOptions({allowExcessMessages: false, maxBytes: 50});
+      leaseManager.on('free', free);
+      subscriber.on('message', message => received.push(message));
+
+      leaseManager.add(active as {} as Message);
+      leaseManager.add(pending);
+      leaseManager.remove(active as {} as Message);
+
+      setImmediate(() => {
+        assert.deepStrictEqual(received, [active, pending]);
+        assert.strictEqual(free.callCount, 1);
+        assert.strictEqual(leaseManager.pending, 0);
+        assert.strictEqual(leaseManager.size, 1);
+        assert.strictEqual(leaseManager.bytes, pending.length);
+        done();
+      });
+    });
+
+    it('should remove a pending message when capacity opens', done => {
+      const active = new FakeMessage() as {} as Message;
+      const pending = new FakeMessage() as {} as Message;
+      const received: Message[] = [];
+      const free = sandbox.spy();
+
+      leaseManager.setOptions({allowExcessMessages: false, maxMessages: 1});
+      leaseManager.on('free', free);
+      subscriber.on('message', message => received.push(message));
+      leaseManager.add(active);
+      leaseManager.add(pending);
+      leaseManager.setOptions({allowExcessMessages: false, maxMessages: 2});
+
+      leaseManager.remove(pending);
+      leaseManager.remove(active);
+
+      setImmediate(() => {
+        assert.deepStrictEqual(received, [active]);
+        assert.strictEqual(free.callCount, 1);
+        assert.strictEqual(leaseManager.pending, 0);
+        assert.strictEqual(leaseManager.size, 0);
+        assert.strictEqual(leaseManager.bytes, 0);
+        done();
+      });
     });
 
     it('log when dispensing a pending message', () => {
@@ -642,6 +706,14 @@ describe('LeaseManager', () => {
     it('should allow excess messages by default', () => {});
 
     it('should default maxBytes', () => {
+      for (const options of [undefined, {}, {maxMessages: 1000}]) {
+        leaseManager.setOptions(options!);
+        assert.strictEqual(
+          getLMInternals(leaseManager)._options.maxBytes,
+          524288000,
+        );
+      }
+
       const littleMessage = new FakeMessage() as {} as Message;
       const bigMessage = new FakeMessage();
 

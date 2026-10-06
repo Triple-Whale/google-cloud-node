@@ -57,7 +57,8 @@ const PULL_TIMEOUT = require('./v1-old/subscriber_client_config.json').interface
  *     underlying streams. See
  *     {@link https://nodejs.org/en/docs/guides/backpressuring-in-streams/} for
  *     more details.
- * @property {number} [maxStreams=5] Number of streaming connections to make.
+ * @property {number} [maxStreams=5] Number of streaming connections to make,
+ *     capped by the positive aggregate message and byte limits.
  * @property {number} [timeout=300000] Timeout for establishing a connection.
  */
 export interface MessageStreamOptions {
@@ -160,6 +161,8 @@ interface StreamTracked {
 export class MessageStream extends PassThrough {
   private _keepAliveHandle?: NodeJS.Timeout;
   private _options: MessageStreamOptions;
+  private _maxMessages: number;
+  private _maxBytes: number;
   private _retrier: ExponentialRetry<StreamTracked>;
 
   private _streams: StreamTracked[];
@@ -176,8 +179,28 @@ export class MessageStream extends PassThrough {
       options.retryMaxBackoff!,
     );
 
+    const maxStreams = Math.floor(
+      Math.min(
+        options.maxStreams!,
+        sub.maxMessages > 0 ? sub.maxMessages : Infinity,
+        sub.maxBytes > 0 ? sub.maxBytes : Infinity,
+      ),
+    );
+
+    // Keep the opening allocation for replacements until the subscriber reopens.
+    this._maxMessages = sub.useLegacyFlowControl
+      ? 0
+      : sub.maxMessages > 0
+        ? Math.floor(sub.maxMessages / maxStreams)
+        : sub.maxMessages;
+    this._maxBytes = sub.useLegacyFlowControl
+      ? 0
+      : sub.maxBytes > 0
+        ? Math.floor(sub.maxBytes / maxStreams)
+        : sub.maxBytes;
+
     this._streams = [];
-    for (let i = 0; i < options.maxStreams!; i++) {
+    for (let i = 0; i < maxStreams; i++) {
       this._streams.push({});
     }
 
@@ -193,11 +216,38 @@ export class MessageStream extends PassThrough {
   async start(): Promise<void> {
     await this._fillStreamPool();
 
+    if (this.destroyed) {
+      return;
+    }
+
     this._keepAliveHandle = setInterval(
       () => this._keepAlive(),
       KEEP_ALIVE_INTERVAL,
     );
     this._keepAliveHandle.unref();
+  }
+
+  /**
+   * Pauses message delivery from all underlying streams.
+   */
+  pause(): this {
+    super.pause();
+    for (const tracker of this._streams) {
+      tracker.stream?.pause();
+      this._clearAliveTimer(tracker);
+    }
+    return this;
+  }
+
+  /**
+   * Resumes message delivery from all underlying streams.
+   */
+  resume(): this {
+    super.resume();
+    for (const tracker of this._streams) {
+      tracker.stream?.resume();
+    }
+    return this;
   }
 
   /**
@@ -264,6 +314,10 @@ export class MessageStream extends PassThrough {
     tracker.stream = stream;
     tracker.receivedStatus = false;
     tracker.lastResponseTime = Date.now();
+
+    if (this.isPaused()) {
+      stream.pause();
+    }
 
     stream
       .on('error', err => this._onError(index, err))
@@ -336,6 +390,11 @@ export class MessageStream extends PassThrough {
     } catch (e) {
       const err = e as Error;
       this.destroy(err);
+      return;
+    }
+
+    if (this.destroyed) {
+      return;
     }
 
     const all: Promise<void>[] = [];
@@ -383,16 +442,16 @@ export class MessageStream extends PassThrough {
       }
     }
 
+    if (this.destroyed) {
+      return;
+    }
+
     const deadline = Date.now() + PULL_TIMEOUT;
     const request: StreamingPullRequest = {
       subscription: this._subscriber.name,
       streamAckDeadlineSeconds: this._subscriber.ackDeadline,
-      maxOutstandingMessages: this._subscriber.useLegacyFlowControl
-        ? 0
-        : this._subscriber.maxMessages,
-      maxOutstandingBytes: this._subscriber.useLegacyFlowControl
-        ? 0
-        : this._subscriber.maxBytes,
+      maxOutstandingMessages: this._maxMessages,
+      maxOutstandingBytes: this._maxBytes,
       clientId: randomUUID().toString(),
       protocolVersion: 1, // Set protocol version to enable server keepalives
     };
@@ -441,7 +500,11 @@ export class MessageStream extends PassThrough {
       if (!tracker.receivedStatus && tracker.stream) {
         tracker.stream.write({});
         tracker.lastPingTime = Date.now();
-        this._setAliveTimer(index);
+        // Paused reads also hold back keepalive responses, so only check
+        // response deadlines while messages can be delivered.
+        if (!this.isPaused()) {
+          this._setAliveTimer(index);
+        }
       }
     });
   }
@@ -461,6 +524,10 @@ export class MessageStream extends PassThrough {
    * @param {object} status The stream status.
    */
   private _onEnd(index: number, status: grpc.StatusObject): void {
+    if (this.destroyed) {
+      return;
+    }
+
     const willRetry = PullRetry.retry(status);
     this._removeStream(
       index,
