@@ -295,6 +295,71 @@ describe('MessageStream', () => {
     });
   });
 
+  describe('pause and resume', () => {
+    it('should pause delivery and drain responses before retrying', async () => {
+      const received: object[] = [];
+      const responses = client.streams.map((_, index) => ({index}));
+      const streamCount = client.streams.length;
+      messageStream.on('data', response => received.push(response));
+
+      messageStream.pause();
+      client.streams.forEach((stream, index) => stream.push(responses[index]));
+      client.streams[0].emit('status', {code: grpc.status.UNAVAILABLE});
+      await promisify(process.nextTick)();
+
+      assert.deepStrictEqual(received, []);
+      assert.strictEqual(client.streams.length, streamCount);
+      client.streams.forEach(stream =>
+        assert.strictEqual(stream.isPaused(), true),
+      );
+
+      messageStream.resume();
+      await promisify(process.nextTick)();
+
+      assert.deepStrictEqual(received, responses);
+      sandbox.clock.tick(200);
+      await promisify(process.nextTick)();
+      assert.strictEqual(client.streams.length, streamCount + 1);
+      assert.strictEqual(client.streams[streamCount].isPaused(), false);
+    });
+
+    it('should pause replacements created after client acquisition', async () => {
+      const received: object[] = [];
+      messageStream.on('data', response => received.push(response));
+
+      const clientReady = defer();
+      const getClient = subscriber.getClient.bind(subscriber);
+      const getClientStub = sandbox
+        .stub(subscriber, 'getClient')
+        .callsFake(async () => {
+          await clientReady.promise;
+          return getClient();
+        });
+      const streamCount = client.streams.length;
+      client.streams[0].emit('status', {code: grpc.status.UNAVAILABLE});
+      await promisify(process.nextTick)();
+      sandbox.clock.tick(200);
+      assert.strictEqual(getClientStub.callCount, 1);
+
+      messageStream.pause();
+      clientReady.resolve();
+      await promisify(process.nextTick)();
+
+      assert.strictEqual(client.streams.length, streamCount + 1);
+      const replacement = client.streams[streamCount];
+      assert.strictEqual(replacement.isPaused(), true);
+      const response = {};
+      replacement.push(response);
+      await promisify(process.nextTick)();
+      assert.deepStrictEqual(received, []);
+
+      messageStream.resume();
+      await promisify(process.nextTick)();
+      assert.deepStrictEqual(received, [response]);
+      assert.strictEqual(client.streams.length, streamCount + 1);
+    });
+  });
+
   describe('destroy', () => {
     it('should noop if already destroyed', done => {
       messageStream.on('close', done);
@@ -322,7 +387,50 @@ describe('MessageStream', () => {
       });
     });
 
-    it('should unpipe and cancel all underlying streams', () => {
+    it('should not start keepalive after destruction during client acquisition', async () => {
+      messageStream.destroy();
+      client.streams.length = 0;
+      const clientReady = defer();
+      const getClient = subscriber.getClient.bind(subscriber);
+      sandbox.stub(subscriber, 'getClient').callsFake(async () => {
+        await clientReady.promise;
+        return getClient();
+      });
+      const intervalStub = sandbox.spy(global, 'setInterval');
+      messageStream = new MessageStream(subscriber);
+      const starting = messageStream.start();
+
+      messageStream.destroy();
+      clientReady.resolve();
+      await starting;
+
+      assert.strictEqual(client.streams.length, 0);
+      assert.strictEqual(intervalStub.callCount, 0);
+    });
+
+    it('should not replace streams after destruction during client acquisition', async () => {
+      const clientReady = defer();
+      const getClient = subscriber.getClient.bind(subscriber);
+      const getClientStub = sandbox
+        .stub(subscriber, 'getClient')
+        .callsFake(async () => {
+          await clientReady.promise;
+          return getClient();
+        });
+      const streamCount = client.streams.length;
+      client.streams[0].emit('status', {code: grpc.status.UNAVAILABLE});
+      await promisify(process.nextTick)();
+      sandbox.clock.tick(200);
+      assert.strictEqual(getClientStub.callCount, 1);
+
+      messageStream.destroy();
+      clientReady.resolve();
+      await promisify(process.nextTick)();
+
+      assert.strictEqual(client.streams.length, streamCount);
+    });
+
+    it('should unpipe and cancel all underlying streams', async () => {
       const stubs = [
         ...client.streams.map(stream => {
           return sandbox.stub(stream, 'unpipe').withArgs(messageStream);
@@ -332,11 +440,14 @@ describe('MessageStream', () => {
         }),
       ];
 
+      client.streams[0].emit('status', {code: grpc.status.UNAVAILABLE});
       messageStream.destroy();
+      await promisify(process.nextTick)();
 
       stubs.forEach(stub => {
         assert.strictEqual(stub.callCount, 1);
       });
+      assert.strictEqual(sandbox.clock.countTimers(), 0);
     });
   });
 
@@ -553,6 +664,35 @@ describe('MessageStream', () => {
           const [data] = stub.lastCall.args;
           assert.deepStrictEqual(data, {});
         });
+      });
+
+      it('should suspend response deadlines while paused', async () => {
+        const cancelSpies = client.streams.map(stream =>
+          sandbox.spy(stream, 'cancel'),
+        );
+        const writeSpies = client.streams.map(stream =>
+          sandbox.spy(stream, 'write'),
+        );
+        const received: object[] = [];
+        messageStream.on('data', response => received.push(response));
+
+        sandbox.clock.tick(30000);
+        messageStream.pause();
+        client.streams.forEach(stream => stream.push({}));
+        await promisify(process.nextTick)();
+        sandbox.clock.tick(60000);
+
+        assert.deepStrictEqual(received, []);
+        cancelSpies.forEach(spy => assert.strictEqual(spy.callCount, 0));
+        writeSpies.forEach(spy => assert.strictEqual(spy.callCount, 3));
+
+        messageStream.resume();
+        await promisify(process.nextTick)();
+        assert.strictEqual(received.length, client.streams.length);
+
+        // Once reads resume, a missing response must still close the stream.
+        sandbox.clock.tick(45000);
+        cancelSpies.forEach(spy => assert.strictEqual(spy.callCount, 1));
       });
 
       it('should close stream if no data received for 15 seconds after keepalive', async () => {

@@ -193,11 +193,38 @@ export class MessageStream extends PassThrough {
   async start(): Promise<void> {
     await this._fillStreamPool();
 
+    if (this.destroyed) {
+      return;
+    }
+
     this._keepAliveHandle = setInterval(
       () => this._keepAlive(),
       KEEP_ALIVE_INTERVAL,
     );
     this._keepAliveHandle.unref();
+  }
+
+  /**
+   * Pauses message delivery from all underlying streams.
+   */
+  pause(): this {
+    super.pause();
+    for (const tracker of this._streams) {
+      tracker.stream?.pause();
+      this._clearAliveTimer(tracker);
+    }
+    return this;
+  }
+
+  /**
+   * Resumes message delivery from all underlying streams.
+   */
+  resume(): this {
+    super.resume();
+    for (const tracker of this._streams) {
+      tracker.stream?.resume();
+    }
+    return this;
   }
 
   /**
@@ -264,6 +291,10 @@ export class MessageStream extends PassThrough {
     tracker.stream = stream;
     tracker.receivedStatus = false;
     tracker.lastResponseTime = Date.now();
+
+    if (this.isPaused()) {
+      stream.pause();
+    }
 
     stream
       .on('error', err => this._onError(index, err))
@@ -336,6 +367,11 @@ export class MessageStream extends PassThrough {
     } catch (e) {
       const err = e as Error;
       this.destroy(err);
+      return;
+    }
+
+    if (this.destroyed) {
+      return;
     }
 
     const all: Promise<void>[] = [];
@@ -381,6 +417,10 @@ export class MessageStream extends PassThrough {
         this.destroy(err);
         return;
       }
+    }
+
+    if (this.destroyed) {
+      return;
     }
 
     const deadline = Date.now() + PULL_TIMEOUT;
@@ -441,7 +481,11 @@ export class MessageStream extends PassThrough {
       if (!tracker.receivedStatus && tracker.stream) {
         tracker.stream.write({});
         tracker.lastPingTime = Date.now();
-        this._setAliveTimer(index);
+        // Paused reads also hold back keepalive responses, so only check
+        // response deadlines while messages can be delivered.
+        if (!this.isPaused()) {
+          this._setAliveTimer(index);
+        }
       }
     });
   }
@@ -461,6 +505,10 @@ export class MessageStream extends PassThrough {
    * @param {object} status The stream status.
    */
   private _onEnd(index: number, status: grpc.StatusObject): void {
+    if (this.destroyed) {
+      return;
+    }
+
     const willRetry = PullRetry.retry(status);
     this._removeStream(
       index,
